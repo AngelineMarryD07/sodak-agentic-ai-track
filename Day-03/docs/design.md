@@ -1,0 +1,16 @@
+# Sprint — design notes
+
+## 1. Why is the unit of retry the tool call, and not the whole request?
+A request can contain several model and tool steps, including side effects such as applying, booking a slot and sending a notification. Repeating the whole request after a crash could repeat side effects that already succeeded. The runner instead records each step and rebuilds the run from `run_step` and `tool_call` records. A pending tool call gets the same stable idempotency key, so `PlacementDb.once()` can return the already stored result instead of performing the effect again. This lets recovery continue from the unfinished step rather than starting the request from zero (`app/runner.py`, `app/idempotency.py`, `app/placement_db.py`).
+
+## 2. Why is the idempotency key stored in placement.db, and why in the same transaction as the side effect?
+The idempotency record protects placement side effects, so it must commit atomically with the data it protects. `PlacementDb.once()` starts one transaction, performs the effect and writes the idempotency row before committing. If the key were written separately in `agent.db`, a crash could occur after an application or notification committed in `placement.db` but before the key committed in `agent.db`. A retry would then see no key and perform the side effect again. Keeping both in `placement.db` makes that partial state impossible (`PlacementDb.once()` in `app/placement_db.py`).
+
+## 3. What happens if the lease is shorter than one model call? What would you change?
+The worker heartbeats only between steps. If a model call takes longer than the lease, another worker can reap and reclaim the run while the first worker is still waiting. The old worker is prevented from completing once it discovers that it lost the lease, but duplicate model work can still happen. I would use a lease comfortably longer than the maximum expected model latency and add a background heartbeat while a long model/tool operation is running. The heartbeat must extend the lease only when the same worker still owns the running job (`RunStore.heartbeat()` and `between_steps()` in `app/runner.py`).
+
+## 4. Why use BEGIN IMMEDIATE instead of plain BEGIN?
+`BEGIN IMMEDIATE` obtains SQLite's write reservation at the start of the transaction. Competing writers therefore wait in a predictable order instead of both beginning as readers and later trying to upgrade to writers. This is important when two workers claim jobs or update placement data concurrently. The queue claim and the protected placement writes can then make their read-and-update decision while holding the write lock (`RunStore.transaction()` and `PlacementDb.transaction()`).
+
+## 5. Name one thing that is still not exactly-once, and what would it take to fix it.
+The model-provider call is not exactly-once. If Gemini produces a response and the worker dies before `record_model_step()` commits it, recovery has no record of that response and can call the model again. Making this exactly-once would require provider support for durable idempotent request IDs/results, or an external durable execution layer that stores the provider result atomically with the workflow state. The placement side effects are protected locally, but an ordinary remote model request cannot be made exactly-once by SQLite alone.
